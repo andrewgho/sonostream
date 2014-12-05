@@ -1,0 +1,261 @@
+#!/usr/bin/env ruby
+# ========================================================================
+# sonostream - tell Sonos speaker to enqueue MP3s from URL
+# Andrew Ho (andrew@zeuscat.com)
+#
+# Copyright (c) 2014, Andrew Ho.
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+# Redistributions of source code must retain the above copyright notice,
+# this list of conditions and the following disclaimer.
+#
+# Redistributions in binary form must reproduce the above copyright
+# notice, this list of conditions and the following disclaimer in the
+# documentation and/or other materials provided with the distribution.
+#
+# Neither the name of the author nor the names of its contributors may
+# be used to endorse or promote products derived from this software
+# without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# ========================================================================
+
+require 'optparse'
+require 'rubygems'
+require 'sonos'
+require 'httpclient'
+require 'nokogiri'
+require 'uri'
+
+ME = File.basename($0)
+USAGE =
+  "usage: #{ME} [-h] [-n] [-s speaker] [-v volume] ( url | play | pause )\n"
+FULL_USAGE = USAGE + <<'end'
+    -h           display this help text and exit
+    -n           dry run, just print what would be enqueued
+    -s speaker   stream to Sonos speaker with this name (default first speaker)
+    -v volume    volume level (default is to use existing volume)
+    url          URL to stream (may be audio/mpeg or HTML index with links)
+    play, pause  play or pause the current queue, without changing it
+end
+
+MAX_VOLUME = 100     # Maximum Sonos volume level
+MAX_RECURSIONS = 10  # Arbitrary limit on how many URLs to recurse through
+
+# Main loop, run at end of file
+def main(argv)
+
+  # Parse command line arguments
+  dry_run = false
+  speaker_name = nil
+  volume = nil
+  verb = nil
+  OptionParser.new do |opts|
+    opts.on('-h',         '--help')    { puts FULL_USAGE; exit 0 }
+    opts.on('-n',         '--dry-run') { dry_run = true }
+    opts.on('-s SPEAKER', '--speaker') { |str| speaker_name = str }
+    opts.on('-v VOLUME',  '--volume')  { |str| volume = str }
+    begin
+      opts.parse!(argv)
+    rescue OptionParser::InvalidOption => e
+      abort "#{ME}: #{e}\n#{USAGE}"
+    end
+  end
+  verb = argv.shift
+  speaker = nil
+
+  # Check that volume is numeric and in allowed range of 0-100
+  if volume
+    unless volume.match(%r{^\d+$})
+      abort "#{ME}: volume must be integer: #{volume}"
+    end
+    volume = volume.to_i
+    if volume < 0 || volume > MAX_VOLUME
+      abort "#{ME}: volume must be in range 0-#{MAX_VOLUME}: #{volume}"
+    end
+
+    # Set volume
+    unless dry_run
+      speaker = sonos_speaker(speaker_name)
+      speaker.volume = volume
+    end
+
+    # If we had volume and no verb or URL, just exit after setting volume
+    return 0 unless verb
+  end
+
+  # Otherwise, verb or URL is required
+  unless verb
+    abort "#{ME}: missing required URL, play, or pause argument\n#{USAGE}"
+  end
+
+  # If play or pause, then do that action and exit
+  if verb == 'play'
+    unless dry_run
+      speaker ||= sonos_speaker(speaker_name)
+      speaker.play
+    end
+    return 0
+  elsif verb == 'pause'
+    unless dry_run
+      speaker ||= sonos_speaker(speaker_name)
+      speaker.pause
+    end
+    return 0
+  elsif !verb.match(%r{^https?://})
+    abort "#{ME}: argument must be URL, play, or pause: #{verb}"
+  end
+
+  # Load URL, recursing through HTML links to find MP3s as needed
+  url = verb
+  songs = []
+  each_link(url, :content_type => 'audio/mpeg', :recursive => true) do |link|
+    unless dry_run
+      speaker ||= sonos_speaker(speaker_name)
+      speaker.clear_queue if songs.empty?
+      speaker.add_to_queue(link)
+    end
+    songs << URI.unescape(link.sub(%r{\A#{url}}, ''))
+  end
+  if songs.empty?
+    abort "#{ME}: could not find audio/mpeg content under URL: #{url}"
+  else
+    songs.each { |s| puts s }
+  end
+
+  unless dry_run
+    speaker ||= sonos_speaker(speaker_name)
+    speaker.volume = volume if volume
+    speaker.play
+  end
+
+  songs.empty? ? 1 : 0
+end
+
+
+# Return Sonos speaker matching name, or first speaker; abort with human 
+# readable message if operation fails.
+
+def sonos_speaker(speaker_name = nil)
+  # Try to load Sonos system and find speaker to interact with
+  system = Sonos::System.new
+  abort "#{ME}: no Sonos system detected" unless system
+  if speaker_name
+    speaker = system.speakers.detect { |s| s.name == speaker_name }
+    abort "#{ME}: could not find speaker name: #{speaker_name}" unless speaker
+  else
+    speaker = system.speakers.first
+    abort "#{ME}: could not find any speakers in Sonos system" unless speaker
+  end
+  speaker
+end
+
+
+# For each link in a URL of an HTML document, run block or collect in array.
+# Pass optional :content_type to only callback or collect URLs that have
+# that basic Content-Type, :recursive to recurse into HTML links.
+
+def each_link(url, opts = {})
+  # Set up callback which either yields or collects links
+  if block_given?
+    callback = lambda { |u| yield(u) }
+  else
+    opts[:retval] ||= nil
+    callback = lambda { |u| retval << u }
+  end
+
+  # Set up state, if first time through
+  opts[:client] ||= HTTPClient.new
+  opts[:visited_link] ||= {}
+  if opts[:recursions].nil?
+    opts[:recursions] = 0
+  else
+    opts[:recursions] += 1
+    if opts[:recursions] > MAX_RECURSIONS
+      abort "#{ME}: exceeded maximum recursion depth: #{MAX_RECURSIONS}"
+    end
+  end
+
+  # Grab first page; if HTML page, pull its links
+  hresult = opts[:client].head(url, :follow_redirect => true)
+  if !hresult.ok?
+    # Do nothing, fall through
+  elsif hresult.content_type.html_type?
+    result = opts[:client].get(url, :follow_redirect => true)
+    if result.ok?
+      Nokogiri::HTML(result.body).css('a').each do |anchor|
+        if (link = anchor.attr('href'))
+          real_url = result.http_header.request_uri.to_s
+          abs_link = URI.join(real_url, link).to_s
+          abs_link, query = abs_link.split(/\?/, 2)
+
+          # Skip links that go upwards, or that we have already seen
+          if abs_link.match(%r{\A#{real_url}.}) &&
+             !opts[:visited_link][abs_link]
+            opts[:visited_link][abs_link] = true
+
+            # Client passed Content-Type, so only collect links that match
+            if (only_type = opts[:content_type])
+              hresult = opts[:client].head(abs_link, :follow_redirect => true)
+              if hresult.ok? && hresult.content_type.matches_type?(only_type)
+                callback.call(abs_link)
+              end
+
+            # Or, act on all links of client did not pass in Content-Type
+            else
+              callback.call(abs_link)
+            end
+
+            # If client requested recursive, and this is HTML, recursive
+            if opts[:recursive]
+              hresult ||= opts[:client].head(abs_link, :follow_redirect => true)
+              if hresult.ok? && hresult.content_type.html_type?
+                each_link(abs_link, opts) { |sublink| callback.call(sublink) }
+              end
+            end
+          end
+        end
+      end
+    end
+
+  # Was not HTML page, so just check if we want to keep single URL
+  elsif !opts[:content_type] ||
+        hresult.content_type.matches_type?(opts[:content_type])
+    callback.call(url)
+  end
+
+  # Returns nil if block was given, list of URLs otherwise
+  opts[:retval]
+end
+
+class String
+  # Return true if string is a text/html MIME type specifier
+  def html_type?
+    self.matches_type?('text/html')
+  end
+
+  # Return true if one base MIME type specifier matches another
+  def matches_type?(other)
+    self.split(/;/, 2).first == other.split(/;/, 2).first
+  end
+end
+
+# Run main loop and exit
+exit main(ARGV)
+
+
+# ========================================================================
